@@ -1,0 +1,437 @@
+---
+title: "Data_Modelling"
+output: html_document
+format:
+    html:
+        embed-resources: true
+---
+
+```{r Memory Clean, include=FALSE}
+rm(list=ls()) # Cleaning R's memory
+
+set.seed(5003) # Setting seed for reproducibility when training models
+
+options(scipen  = 999) #Removing scientific notation
+
+#Loading required packages
+library(dplyr)
+library(readr)
+library(purrr)
+
+  #Random Forest
+library(ranger)
+library(caret)
+library(class)
+
+
+```
+
+## Data Ingestion
+
+```{r Data Ingestion}
+IDS_data <- read.csv("C:/Users/jaite/Uni/computational stats project/IDS-data-2022-2023.csv", check.names = FALSE, fileEncoding = "Windows-1252") #IDS dataset
+drug_list <- read.csv("C:/Users/jaite/Uni/computational stats project/drug_list.csv", check.names = FALSE, fileEncoding = "Windows-1252") # List for converting 'drug types' into 'drug class'
+```
+
+## Data Cleaning/Preparation
+
+```{r, convertNamesToReadableFormat}
+# Fix the column names
+colnames(IDS_data) <- make.names(colnames(IDS_data))
+colnames(drug_list) <- make.names(colnames(drug_list))
+
+# Check the modified column names
+colnames(IDS_data)
+colnames(drug_list)
+```
+```{r Conversion NA/Unknown values}
+# Replacing 'Data not available' with NA for `Physical Seizure Location` and `Trafficking Mode of Transportation` columns
+IDS_data <- IDS_data %>%
+  mutate(
+    # NA Conversion:
+    `Physical.Seizure.Location` = na_if(`Physical.Seizure.Location`, "Data not available"), 
+    `Trafficking.Mode.of.Transportation` = na_if(`Trafficking.Mode.of.Transportation`, "Data not available"),
+    `Trafficking.Mode.of.Transportation` = na_if(`Trafficking.Mode.of.Transportation`, "Not applicable/not transported")
+  )
+```
+
+```{r Converting instances of blank cells to NA for'City' and 'Administrative Region' columns}
+IDS_data$City[IDS_data$City == ""] <- NA
+IDS_data$`Administrative.Region`[IDS_data$`Administrative.Region` == ""] <- NA
+```
+
+```{r Conversion of columns to factor types and NA/Unknown values}
+# Converting column data types
+IDS_data <- IDS_data %>%
+  mutate(
+    # Date data type conversion:
+    `Seizure.Date` = as.Date(`Seizure.Date`, format = "%d/%m/%Y"),
+    # Categorical variable to factor data type conversion:
+    `Drug.Substance` = as.factor(`Drug.Substance`),  
+    `Country.Territory.of.Seizure` = as.factor(`Country.Territory.of.Seizure`),
+    `ISO3` = as.factor(`ISO3`),
+    `Subregion` = as.factor(`Subregion`),
+    `Region` = as.factor(`Region`),
+    `City` = as.factor(`City`),
+    `Administrative.Region` = as.factor(`Administrative.Region`),
+    `Physical.Seizure.Location` = as.factor(`Physical.Seizure.Location`),
+    `Trafficking.Mode.of.Transportation` = as.factor(`Trafficking.Mode.of.Transportation`),# Target variable
+    `Source` = as.factor(`Source`),
+    `Reporting.Channel` = as.factor(`Reporting.Channel`)
+  )
+```
+
+```{r Removing 'Source' and 'Reporting Channel' columns}
+IDS_data <- IDS_data[, !(names(IDS_data) %in% c("Source", "Reporting.Channel"))]
+```
+
+```{r Left joining drug_list.csv}
+# Converting drug_list variables into factor data types
+drug_list <- drug_list %>%
+  mutate(
+    `Drug.Name.Type` = as.factor(`Drug.Name.Type`),
+    `Drug.Class` = as.factor(`Drug.Class`)
+)
+
+# Performing left join:
+IDS_data <- left_join(IDS_data, drug_list, by = c("Drug.Substance" = "Drug.Name.Type"))
+```
+
+```{r Filtering to only kg or g measured drug seizure instances}
+# Filtering data for only including where the Measurement Unit is in kg or g (this excludes 7,184 rows)
+IDS_data <- IDS_data %>% filter(`Measurement.Unit` %in% c("kg", "g"))
+
+# Creating converting kg quantities into grams
+IDS_data <- IDS_data %>%
+  mutate(`Quantity.Seized.In.Grams` = ifelse(`Measurement.Unit` == "kg", 
+                                             `Quantity.Seized` * 1000, `Quantity.Seized`)) %>% 
+  relocate(`Quantity.Seized.In.Grams`, .after = `Measurement.Unit`)
+
+```
+
+```{r Removing Quantity Seized column}
+IDS_data <- IDS_data[, !(names(IDS_data) %in% c("Quantity.Seized"))]
+```
+
+
+```{r Creating dataset versions - with/without NA values for Trafficking Mode of Transportation}
+IDS_data_no_NA_target <- IDS_data[!is.na(IDS_data$`Trafficking.Mode.of.Transportation`), ] #removing NA trafficking mode
+IDS_data_no_NA_all <- na.omit(IDS_data) # Removing ALL rows with NA values
+```
+
+
+```{r saveDatasetsinRDSfile}
+
+saveRDS(IDS_data_no_NA_all, "IDS_data_no_NA_all.rds")
+saveRDS(IDS_data_no_NA_target, "IDS_data_no_NA_target.rds")
+
+```
+
+```{r loadRDSfiles}
+
+IDS_data_no_NA_all <- readRDS("IDS_data_no_NA_all.rds")
+IDS_data_no_NA_target <- readRDS("IDS_data_no_NA_target.rds")
+
+```
+
+
+```{r Ayra's imputation code}
+# Function to replace NA with mode
+replace_with_mode <- function(x) {
+  mode_value <- get_mode(x)
+  x[is.na(x)] <- mode_value
+  return(x)
+}
+
+# Function to calculate mode
+get_mode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+# Find columns with missing values
+cols_with_missing_values <- c("City","Physical.Seizure.Location","Drug.Class","Administrative.Region")
+
+# Apply the replacement function only to the columns with missing values
+IDS_data_no_NA_target[cols_with_missing_values] <- map(IDS_data_no_NA_target[cols_with_missing_values], replace_with_mode)
+```
+
+## oversampling technique
+```{r}
+# Separate minority classes
+minority_classes <- c("Animals", "Other")
+minority_dat <- IDS_data_no_NA_target[IDS_data_no_NA_target$Trafficking.Mode.of.Transportation %in% minority_classes, ]
+majority_dat <- IDS_data_no_NA_target[!IDS_data_no_NA_target$Trafficking.Mode.of.Transportation %in% minority_classes, ]
+
+# Random over-sampling for "Animals" and "Other"
+minority_oversampled_dat <- minority_dat[sample(nrow(minority_dat), 
+                                                    size = 5000,  # Adjust this number as needed
+                                                    replace = TRUE), ]
+
+# I've changed the number to 5000 since the majority class with the highest count i.e. Postal/Mail/Express Parcel has roughly 5000 counts
+
+# Combine oversampled minority classes with majority classes
+IDS_data_no_NA_target_balanced <- rbind(majority_dat , minority_oversampled_dat)
+
+
+```
+## k-Nearest-Neighbor (kNN)
+
+###knn on no na target
+
+```{r, knnOnNoNAtarget}
+# Define the features
+features <- c("Physical.Seizure.Location", "Region", "Subregion",  "Country.Territory.of.Seizure", "Drug.Substance", "Quantity.Seized.In.Grams", "Administrative.Region")
+
+knn_model_no_NA_target_data <- IDS_data_no_NA_target[, c(features, "Trafficking.Mode.of.Transportation")]
+
+# Convert the target to a factor
+knn_model_no_NA_target_data$Trafficking.Mode.of.Transportation <- as.factor(knn_model_no_NA_target_data$Trafficking.Mode.of.Transportation)
+
+# Normalize the numerical data
+knn_model_no_NA_target_data$Quantity.Seized.In.Grams <- scale(knn_model_no_NA_target_data$Quantity.Seized.In.Grams)
+
+# Split the data
+dataSplit <- createDataPartition(knn_model_no_NA_target_data$Trafficking.Mode.of.Transportation, p = 0.7, list = FALSE)
+train_data <- knn_model_no_NA_target_data[dataSplit, ]
+test_data <- knn_model_no_NA_target_data[-dataSplit, ]
+
+# Set up trainControl for 10-fold cross-validation
+ctrl <- trainControl(method = "cv", number = 10)
+
+# Define the range of k values to tune
+k_values <- expand.grid(k = c(20,30,40))
+
+# Train the kNN model
+knn_model <- train(
+  Trafficking.Mode.of.Transportation ~ ., 
+  data = train_data, 
+  method = "knn", 
+  trControl = ctrl,
+  tuneGrid = k_values
+)
+
+# Print the results
+print(knn_model)
+
+# Predict on the test set
+predictions <- predict(knn_model, newdata = test_data)
+
+# Calculate accuracy
+accuracy <- mean(predictions == test_data$Trafficking.Mode.of.Transportation)
+cat("Accuracy on test data:", round(accuracy, 4), "\n")
+
+# Create a confusion matrix
+conf_matrix <- confusionMatrix(predictions, test_data$Trafficking.Mode.of.Transportation)
+
+data.frame(Accuracy = conf_matrix$overall["Accuracy"],
+           Sensitivity = conf_matrix$byClass["Sensitivity"],
+           Specificity = conf_matrix$byClass["Specificity"])
+```
+
+```{r}
+# Define the features
+features <- c("Physical.Seizure.Location", "Region", "Subregion", "ISO3", "Country.Territory.of.Seizure", "Drug.Substance", "Quantity.Seized.In.Grams", "Administrative.Region")
+
+knn_model_no_NA_target_data <- IDS_data_no_NA_target_balanced [, c(features, "Trafficking.Mode.of.Transportation")]
+
+# Convert the target to a factor
+knn_model_no_NA_target_data$Trafficking.Mode.of.Transportation <- as.factor(knn_model_no_NA_target_data$Trafficking.Mode.of.Transportation)
+
+# Normalize the numerical data
+knn_model_no_NA_target_data$Quantity.Seized.In.Grams <- scale(knn_model_no_NA_target_data$Quantity.Seized.In.Grams)
+
+# Split the data
+dataSplit <- createDataPartition(knn_model_no_NA_target_data$Trafficking.Mode.of.Transportation, p = 0.7, list = FALSE)
+train_data <- knn_model_no_NA_target_data[dataSplit, ]
+test_data <- knn_model_no_NA_target_data[-dataSplit, ]
+
+# Set up trainControl for 10-fold cross-validation
+ctrl <- trainControl(method = "cv", number = 10)
+
+# Define the range of k values to tune
+k_values <- expand.grid(k = c(50, 75, 100))
+
+# Train the kNN model
+knn_model <- train(
+  Trafficking.Mode.of.Transportation ~ ., 
+  data = train_data, 
+  method = "knn", 
+  trControl = ctrl,
+  tuneGrid = k_values
+)
+
+# Print the results
+print(knn_model)
+
+# Predict on the test set
+predictions <- predict(knn_model, newdata = test_data)
+
+# Calculate accuracy
+accuracy <- mean(predictions == test_data$Trafficking.Mode.of.Transportation)
+cat("Accuracy on test data:", round(accuracy, 4), "\n")
+
+# Create a confusion matrix
+conf_matrix <- confusionMatrix(predictions, test_data$Trafficking.Mode.of.Transportation)
+
+# Extract sensitivity and specificity
+sensitivity <- conf_matrix$byClass["Sensitivity"]
+specificity <- conf_matrix$byClass["Specificity"]
+
+# Print sensitivity and specificity
+cat("Sensitivity:", round(sensitivity, 4), "\n")
+cat("Specificity:", round(specificity, 4), "\n")
+
+                             
+```
+
+
+Knn no na all
+
+```{r, knn_no_NA_all}
+features <- c("Physical.Seizure.Location", "Region", "Subregion", "ISO3", "Country.Territory.of.Seizure", "Drug.Substance", "Quantity.Seized.In.Grams", "Administrative.Region") 
+
+knn_model_no_NA_all_data <- IDS_data_no_NA_all[, c(features, "Trafficking.Mode.of.Transportation")]
+
+# Convert the target to a factor
+knn_model_no_NA_all_data$Trafficking.Mode.of.Transportation <- as.factor(knn_model_no_NA_all_data$Trafficking.Mode.of.Transportation)
+
+# Normalize the numerical data
+knn_model_no_NA_all_data$Quantity.Seized.In.Grams <- scale(knn_model_no_NA_all_data$Quantity.Seized.In.Grams)
+
+# Split the data
+dataSplit_zero_NA <- createDataPartition(knn_model_no_NA_all_data$Trafficking.Mode.of.Transportation, p = 0.7, list = FALSE)
+train_data <- knn_model_no_NA_all_data[dataSplit_zero_NA, ]
+test_data <- knn_model_no_NA_all_data[-dataSplit_zero_NA, ]
+
+# Set up trainControl for 10-fold cross-validation
+ctrl <- trainControl(method = "cv", number = 10)
+
+# Define the range of k values to tune
+k_values <- expand.grid(k = c(3, 7, 10))
+
+# Train the kNN model
+knn_model_zero_NA <- train(
+  Trafficking.Mode.of.Transportation ~ ., 
+  data = train_data_zero_NA, 
+  method = "knn", 
+  trControl = ctrl,
+  tuneGrid = k_values
+)
+
+# Print the results
+print(knn_model_zero_NA )
+
+# Predict on the test set
+predictions_zero_NA <- predict(knn_model_zero_NA , newdata = test_data_zero_NA)
+
+# Calculate accuracy
+accuracy <- mean(predictions_zero_NA == test_data_zero_NA$Trafficking.Mode.of.Transportation)
+cat("Accuracy on test data:", round(accuracy, 4), "\n")
+
+# Create a confusion matrix
+conf_matrix <- confusionMatrix(predictions, test_data$Trafficking.Mode.of.Transportation)
+
+# Extract sensitivity and specificity
+sensitivity <- conf_matrix$byClass["Sensitivity"]
+specificity <- conf_matrix$byClass["Specificity"]
+
+# Print sensitivity and specificity
+cat("Sensitivity:", round(sensitivity, 4), "\n")
+cat("Specificity:", round(specificity, 4), "\n")
+```
+
+```{r, confusionMatrix_NoNATarget}
+
+confusionMatrix(predictions, test_data$Trafficking.Mode.of.Transportation)
+
+```
+
+
+```{r, confusionMatrix_NoNAall}
+
+confusionMatrix(predictions_zero_NA, test_data_zero_NA$Trafficking.Mode.of.Transportation)
+
+```
+
+## Random Forest
+
+```{r}
+# Function for prepare data, train model, and evaluate
+train_and_evaluate <- function(data, dataset_name) {
+  
+  # Selecting features for the model
+  features <- c("Country.Territory.of.Seizure", "Subregion", "Region", "Drug.Substance", 
+                "Quantity.Seized.In.Grams", "Physical.Seizure.Location", "Drug.Class")
+  
+  # Preparing the data
+  model_data <- data[, c(features, "Trafficking.Mode.of.Transportation")]
+
+  # Create train-test split (70/30)
+  train_index <- createDataPartition(model_data$Trafficking.Mode.of.Transportation, p = 0.7, list = FALSE)
+  train_data <- model_data[train_index, ]
+  test_data <- model_data[-train_index, ]
+  
+  # Train the random forest model
+  rf_model <- ranger(
+    formula = Trafficking.Mode.of.Transportation ~ .,
+    data = train_data,
+    num.trees = 500,
+    importance = "impurity"
+  )
+  
+  # Make predictions on test data
+  predictions <- predict(rf_model, data = test_data)
+  
+  # Calculate accuracy
+  accuracy <- mean(predictions$predictions == test_data$Trafficking.Mode.of.Transportation)
+  
+  # Print results
+  cat("\nResults for", dataset_name, ":\n")
+  cat("Number of observations:", nrow(model_data), "\n")
+  cat("Accuracy:", round(accuracy, 4), "\n")
+  
+  # Print feature importance
+  imp <- importance(rf_model)
+  imp_df <- data.frame(Feature = names(imp), Importance = imp)
+  imp_df <- imp_df[order(-imp_df$Importance), ]
+  print(imp_df)
+  
+  return(list(model = rf_model, 
+              accuracy = accuracy, 
+              importance = imp_df,
+              predicted_labels = predictions$predictions,
+              actual_labels = test_data$Trafficking.Mode.of.Transportation))
+}
+
+# Train and evaluate models for both datasets
+results_no_NA <- train_and_evaluate(IDS_data_no_NA_all, "IDS_data_no_NA_all")
+results_full <- train_and_evaluate(IDS_data_no_NA_target, "IDS_data_no_NA_target")
+
+# Compare the results
+cat("\nComparison of accuracies:\n")
+cat("IDS_data_no_NA_all accuracy:", round(results_no_NA$accuracy, 4), "\n")
+cat("IDS_data_no_NA_target accuracy:", round(results_full$accuracy, 4), "\n")
+
+# Compare feature importance
+cat("\nTop 5 important features for IDS_data_no_NA_all:\n")
+print(head(results_no_NA$importance, 5))
+
+cat("\nTop 5 important features for IDS_data_no_NA_target:\n")
+print(head(results_full$importance, 5))
+
+```
+
+```{r, viewConfusionMatrixForResults_Full}
+
+confusionMatrix(results_full$predicted_labels, results_full$actual_labels)
+
+```
+
+```{r}
+
+confusionMatrix(results_no_NA$predicted_labels, results_no_NA$actual_labels)
+
+
+```
+
